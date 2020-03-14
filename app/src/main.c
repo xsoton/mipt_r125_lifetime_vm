@@ -22,16 +22,18 @@
 #define HANTEK_TMC "/dev/usbtmc0"
 #define PPS_GPIB_NAME "AKIP-1142/3G"
 #define VM_GPIB_NAME "AKIP-V7-78/1"
+#define IF_GPIB_NAME "GPIB-USB-HS"
 
 // === pps
 #define PPS_TIMEOUT_S 1
 
 // === vm
 #define VM_TIMEOUT_S 1
+#define VM_POINTS 1000
 
 // === osc
 #define OSC_TIMEOUT_S 1
-#define OSC_TRIGGER_DELAY_US 50000
+#define OSC_TRIGGER_DELAY_US 5000
 
 // === common
 #define REPETITIONS 1
@@ -179,14 +181,16 @@ void *worker(void *arg)
 	int osc_fd;
 	int pps_fd;
 	int vm_fd;
+	int if_fd;
 
 	char filename_lt[100];
 	char gnuplot_cmd[100];
 	FILE *lt_fp;
 	FILE *gp;
+	char buf[100];
 
 	char *rbuf;
-	const size_t rbufsize = 20000000;
+	const size_t rbufsize = 2000000;
 
 	rbuf = (char *) malloc(rbufsize);
 	if (rbuf == NULL)
@@ -220,6 +224,13 @@ void *worker(void *arg)
 	}
 	vm_fd = r;
 
+	r = ibfind(IF_GPIB_NAME);
+	if(r == -1)
+	{
+		fprintf(stderr, "# E: Unable to open interface board (%d)\n", r);
+		goto worker_if_ibfind;
+	}
+	if_fd = r;
 
 	// === init pps
 	gpib_write(pps_fd, "output 0");
@@ -247,7 +258,8 @@ void *worker(void *arg)
 	gpib_write(vm_fd, "trigger:delay:auto off");
 	gpib_write(vm_fd, "trigger:delay 0");
 	gpib_write(vm_fd, "trigger:count 1");
-	gpib_write(vm_fd, "sample:count 50000");
+	snprintf(buf, 100, "sample:count %d", VM_POINTS);
+	gpib_write(vm_fd, buf);
 
 	sleep(VM_TIMEOUT_S);
 
@@ -266,6 +278,8 @@ void *worker(void *arg)
 	usbtmc_write(osc_fd, "dds:switch 1");
 
 	sleep(OSC_TIMEOUT_S);
+
+	ibconfig(if_fd, IbcAUTOPOLL, 1);
 
 	// === create log file
 	snprintf(filename_lt, 100, "%s/lifetime.dat", dir_name);
@@ -380,10 +394,15 @@ void *worker(void *arg)
 
 				memset(rbuf, 0, rbufsize);
 
+				gpib_write(vm_fd, "*cls");
+				gpib_write(vm_fd, "*sre 16");
+
 				t1 = get_time();
 
-				gpib_write(vm_fd, "read?");
+				gpib_write(vm_fd, "init");
+
 				usleep(OSC_TRIGGER_DELAY_US);
+
 				if (falling == 0)
 				{
 					usbtmc_write(osc_fd, "dds:offset 3.5");
@@ -393,11 +412,24 @@ void *worker(void *arg)
 					usbtmc_write(osc_fd, "dds:offset 0");
 				}
 
-				gpib_read(vm_fd, rbuf, rbufsize);
+				r = ibwait(vm_fd, RQS | TIMO);
+
 				t2 = get_time();
 
-				// fwrite(rbuf, rbufsize, 1, curve_fp);
-				for (int i = 0, j = 0; i < 50000; ++i)
+				if(r | RQS)
+				{
+					fprintf(stderr, "RQS\n");
+				}
+				else if(r | TIMO)
+				{
+					fprintf(stderr, "TIMO\n");
+				}
+
+				gpib_write(vm_fd, "fetch?");
+				gpib_read(vm_fd, rbuf, rbufsize);
+
+
+				for (int i = 0, j = 0; i < VM_POINTS; ++i)
 				{
 					char *b = rbuf + j;
 					for (; j < rbufsize; ++j)
@@ -412,7 +444,7 @@ void *worker(void *arg)
 					}
 				}
 
-				fprintf(curve_fp, "duration = %le\n", t2 - t1);
+				fprintf(curve_fp, "# duration = %le\n", t2 - t1);
 
 				gpib_print_error(vm_fd);
 
@@ -483,6 +515,8 @@ void *worker(void *arg)
 		fprintf(stderr, "# E: Unable to close file \"%s\" (%s)\n", filename_lt, strerror(errno));
 	}
 	worker_lt_fopen:
+
+	worker_if_ibfind:
 
 	ibclr(vm_fd);
 	gpib_write(vm_fd, "*rst");

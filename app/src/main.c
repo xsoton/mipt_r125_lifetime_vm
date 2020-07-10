@@ -29,14 +29,14 @@
 
 // === vm
 #define VM_TIMEOUT_S 1
-#define VM_POINTS 1000
+#define VM_POINTS 2000
 
 // === osc
 #define OSC_TIMEOUT_S 1
-#define OSC_TRIGGER_DELAY_US 5000
+#define OSC_TRIGGER_DELAY_US 100
 
 // === common
-#define REPETITIONS 1
+#define REPETITIONS 10
 
 // === threads
 void *commander(void *);
@@ -47,12 +47,17 @@ int get_run();
 void set_run(int run_new);
 double get_time();
 
-int gpib_write(int fd, const char *str);
-int gpib_read(int fd, char *buf, long len);
-void gpib_print_error(int fd);
+int gpib_open(const char *name);
+int gpib_close(int dev);
+int gpib_read(int dev, char *buf, size_t buf_length);
+int gpib_write(int dev, const char *str);
+int gpib_print(int dev, const char *format, ...);
+void gpib_print_error(int dev);
 
-int usbtmc_write(int dev, const char *cmd);
-int usbtmc_read(int dev, char *buf, int buf_length);
+int usbtmc_open(const char *name);
+int usbtmc_close(int dev);
+int usbtmc_read(int dev, char *buf, size_t buf_length);
+int usbtmc_write(int dev, const char *str);
 int usbtmc_print(int dev, const char *format, ...);
 
 // === global variables
@@ -200,37 +205,10 @@ void *worker(void *arg)
 	}
 
 	// === first we are connecting to instruments
-	r = open(HANTEK_TMC, O_RDWR);
-	if(r == -1)
-	{
-		fprintf(stderr, "# E: Unable to open hantek (%s)\n", strerror(errno));
-		goto worker_open_hantek;
-	}
-	osc_fd = r;
-
-	r = ibfind(PPS_GPIB_NAME);
-	if(r == -1)
-	{
-		fprintf(stderr, "# E: Unable to open power supply (%d)\n", r);
-		goto worker_pps_ibfind;
-	}
-	pps_fd = r;
-
-	r = ibfind(VM_GPIB_NAME);
-	if(r == -1)
-	{
-		fprintf(stderr, "# E: Unable to open voltmeter (%d)\n", r);
-		goto worker_vm_ibfind;
-	}
-	vm_fd = r;
-
-	r = ibfind(IF_GPIB_NAME);
-	if(r == -1)
-	{
-		fprintf(stderr, "# E: Unable to open interface board (%d)\n", r);
-		goto worker_if_ibfind;
-	}
-	if_fd = r;
+	r = osc_fd = usbtmc_open(HANTEK_TMC);  if(r == -1) goto worker_open_hantek;
+	r = pps_fd = gpib_open(PPS_GPIB_NAME); if(r == -1) goto worker_pps_ibfind;
+	r = vm_fd  = gpib_open(VM_GPIB_NAME);  if(r == -1) goto worker_vm_ibfind;
+	r = if_fd  = gpib_open(IF_GPIB_NAME);  if(r == -1) goto worker_if_ibfind;
 
 	// === init pps
 	gpib_write(pps_fd, "output 0");
@@ -258,8 +236,8 @@ void *worker(void *arg)
 	gpib_write(vm_fd, "trigger:delay:auto off");
 	gpib_write(vm_fd, "trigger:delay 0");
 	gpib_write(vm_fd, "trigger:count 1");
-	snprintf(buf, 100, "sample:count %d", VM_POINTS);
-	gpib_write(vm_fd, buf);
+	gpib_write(vm_fd, "data:feed rdg_store, \"calculate\"");
+	gpib_print(vm_fd, "sample:count %d", VM_POINTS);
 
 	sleep(VM_TIMEOUT_S);
 
@@ -384,7 +362,7 @@ void *worker(void *arg)
 				// === write curve header
 				r = fprintf(curve_fp,
 					"# mipt_r125_lifetime_vm\n"
-					"# Decay curves\n"
+					"# Decay curve\n"
 					"# Experiment name \"%s\"\n"
 					"# Columns:\n"
 					"# 1 - index\n"
@@ -394,7 +372,10 @@ void *worker(void *arg)
 
 				memset(rbuf, 0, rbufsize);
 
+				// ibcmd(if_fd, DCL);
+				// usleep(1000);
 				gpib_write(vm_fd, "*cls");
+				usleep(1000);
 				gpib_write(vm_fd, "*sre 16");
 
 				t1 = get_time();
@@ -403,31 +384,20 @@ void *worker(void *arg)
 
 				usleep(OSC_TRIGGER_DELAY_US);
 
-				if (falling == 0)
-				{
-					usbtmc_write(osc_fd, "dds:offset 3.5");
-				}
-				else
-				{
-					usbtmc_write(osc_fd, "dds:offset 0");
-				}
+				if (falling == 0) usbtmc_write(osc_fd, "dds:offset 3.5");
+				else              usbtmc_write(osc_fd, "dds:offset 0");
 
-				r = ibwait(vm_fd, RQS | TIMO);
+				fprintf(stderr, "# [debug] wait...\n");
+
+				gpib_write(vm_fd, "fetch?");
+				r = ibwait(if_fd, SRQI | TIMO);
 
 				t2 = get_time();
 
-				if(r | RQS)
-				{
-					fprintf(stderr, "RQS\n");
-				}
-				else if(r | TIMO)
-				{
-					fprintf(stderr, "TIMO\n");
-				}
+				if     (r | SRQI) fprintf(stderr, "SRQI\n");
+				else if(r | TIMO) fprintf(stderr, "TIMO\n");
 
-				gpib_write(vm_fd, "fetch?");
 				gpib_read(vm_fd, rbuf, rbufsize);
-
 
 				for (int i = 0, j = 0; i < VM_POINTS; ++i)
 				{
@@ -518,23 +488,13 @@ void *worker(void *arg)
 
 	worker_if_ibfind:
 
-	ibclr(vm_fd);
-	gpib_write(vm_fd, "*rst");
-	sleep(1);
-	ibloc(vm_fd);
+	gpib_close(vm_fd);
 	worker_vm_ibfind:
 
-	ibclr(pps_fd);
-	gpib_write(pps_fd, "*rst");
-	sleep(PPS_TIMEOUT_S);
-	ibloc(pps_fd);
+	gpib_close(pps_fd);
 	worker_pps_ibfind:
 
-	r = close(osc_fd);
-	if(r == -1)
-	{
-		fprintf(stderr, "# E: Unable to close hantek (%s)\n", strerror(errno));
-	}
+	usbtmc_close(osc_fd);
 	worker_open_hantek:
 
 	free(rbuf);
@@ -600,54 +560,173 @@ double get_time()
 	return ret;
 }
 
+// === GPIB ===
 
-int gpib_write(int fd, const char *str)
-{
-	return ibwrt(fd, str, strlen(str));
-}
-
-int gpib_read(int fd, char *buf, long len)
+int gpib_open(const char *name)
 {
 	int r;
 
-	r = ibrd(fd, buf, len);
-	if (ibcnt < len)
-	{
-		buf[ibcnt] = 0;
-	}
-
-	return r;
-}
-
-void gpib_print_error(int fd)
-{
-	char buf[100] = {0};
-	gpib_write(fd, "system:error?");
-	gpib_read(fd, buf, 100);
-	fprintf(stderr, "[debug] error = %s\n", buf);
-}
-
-int usbtmc_write(int dev, const char *cmd)
-{
-	int r;
-
-	r = write(dev, cmd, strlen(cmd));
+	r = ibfind(name);
 	if (r == -1)
 	{
-		fprintf(stderr, "# E: unable to write to hantek (%s)\n", strerror(errno));
+		fprintf(stderr, "# E: unable to open gpib (ibsta = %d, iberr = %d)\n", ibsta, iberr);
 	}
 
 	return r;
 }
 
-int usbtmc_read(int dev, char *buf, int buf_length)
+int gpib_close(int dev)
+{
+	int r;
+	int ret = 0;
+
+	r = ibclr(dev);
+	if (r & 0x8000)
+	{
+		ret = -1;
+		fprintf(stderr, "# E: unable to clr gpib (ibsta = %d, iberr = %d)\n", ibsta, iberr);
+	}
+
+	r = gpib_write(dev, "*rst");
+	if (r == -1)
+	{
+		ret = r;
+	}
+
+	sleep(1);
+
+	r = ibloc(dev);
+	if (r & 0x8000)
+	{
+		ret = -1;
+		fprintf(stderr, "# E: unable to loc gpib (ibsta = %d, iberr = %d)\n", ibsta, iberr);
+	}
+
+	return ret;
+}
+
+int gpib_read(int dev, char *buf, size_t buf_length)
+{
+	int r;
+	int ret = 0;
+
+	r = ibrd(dev, buf, buf_length);
+	if (r & 0x8000)
+	{
+		ret = -1;
+		fprintf(stderr, "# E: unable to write to gpib (ibsta = %d, iberr = %d)\n", ibsta, iberr);
+	}
+	else
+	{
+		ret = ibcnt;
+		if (ibcnt < buf_length)
+		{
+			buf[ibcnt] = 0;
+		}
+	}
+
+	return ret;
+}
+
+int gpib_write(int dev, const char *str)
+{
+	int r;
+	int ret = 0;
+
+	r = ibwrt(dev, str, strlen(str));
+	if (r & 0x8000)
+	{
+		ret = -1;
+		fprintf(stderr, "# E: unable to write to gpib (ibsta = %d, iberr = %d)\n", ibsta, iberr);
+	}
+	else
+	{
+		ret = ibcnt;
+	}
+
+	return ret;
+}
+
+int gpib_print(int dev, const char *format, ...)
+{
+	int r;
+	va_list args;
+	char buf[100];
+	const size_t bufsize = 100;
+
+	va_start(args, format);
+	r = vsnprintf(buf, bufsize, format, args);
+	if (r < 0)
+	{
+		fprintf(stderr, "# E: unable to printf to buffer (%s)\n", strerror(errno));
+		goto gpib_print_vsnprintf;
+	}
+	r = gpib_write(dev, buf);
+	gpib_print_vsnprintf:
+	va_end(args);
+
+	return r;
+}
+
+void gpib_print_error(int dev)
+{
+	char buf[100] = {0};
+	gpib_write(dev, "system:error?");
+	gpib_read(dev, buf, 100);
+	fprintf(stderr, "# [debug] error = %s\n", buf);
+}
+
+// === USBTMC ===
+
+int usbtmc_open(const char *name)
+{
+	int r;
+
+	r = open(name, O_RDWR);
+	if (r == -1)
+	{
+		fprintf(stderr, "# E: unable to open usbtmc \"%s\" (%s)\n", name, strerror(errno));
+	}
+
+	return r;
+}
+
+int usbtmc_close(int dev)
+{
+	int r;
+
+	usbtmc_write(dev, "*rst");
+
+	r = close(dev);
+	if (r == -1)
+	{
+		fprintf(stderr, "# E: unable to close usbtmc (%s)\n", strerror(errno));
+	}
+
+	return r;
+}
+
+int usbtmc_read(int dev, char *buf, size_t buf_length)
 {
 	int r;
 
 	r = read(dev, buf, buf_length);
 	if (r == -1)
 	{
-		fprintf(stderr, "# E: unable to read from hantek (%s)\n", strerror(errno));
+		fprintf(stderr, "# E: unable to read from usbtmc (%s)\n", strerror(errno));
+	}
+
+	return r;
+}
+
+int usbtmc_write(int dev, const char *str)
+{
+	int r;
+
+	r = write(dev, str, strlen(str));
+	if (r == -1)
+	{
+		fprintf(stderr, "# E: unable to write to usbtmc \"%s\" (%s)\n", str, strerror(errno));
 	}
 
 	return r;
@@ -656,17 +735,15 @@ int usbtmc_read(int dev, char *buf, int buf_length)
 int usbtmc_print(int dev, const char *format, ...)
 {
 	int r;
-    va_list args;
+	va_list args;
 
-    va_start(args, format);
-
-    r = vdprintf(dev, format, args);
-    if (r < 0)
+	va_start(args, format);
+	r = vdprintf(dev, format, args);
+	if (r < 0)
 	{
-		fprintf(stderr, "# E: unable to printf to hantek (%s)\n", strerror(errno));
+		fprintf(stderr, "# E: unable to printf to usbtmc (%s)\n", strerror(errno));
 	}
+	va_end(args);
 
-    va_end(args);
-
-    return r;
+	return r;
 }

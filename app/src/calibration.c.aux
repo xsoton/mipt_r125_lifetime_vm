@@ -1,0 +1,438 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <sys/time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <math.h>
+#include <stdarg.h>
+
+#include <gpib/ib.h>
+
+// === config
+#define VM_GPIB_NAME "AKIP-V7-78/1"
+#define IF_GPIB_NAME "GPIB-USB-HS"
+
+// === vm
+#define VM_POINTS 2000
+#define VM_POINTS_STEP 20
+
+
+// === common
+#define REPETITIONS 10
+
+// === threads
+void *commander(void *);
+void *worker(void *);
+
+// === utils
+int get_run();
+void set_run(int run_new);
+double get_time();
+
+int gpib_open(const char *name);
+int gpib_close(int dev);
+int gpib_read(int dev, char *buf, size_t buf_length);
+int gpib_write(int dev, const char *str);
+int gpib_print(int dev, const char *format, ...);
+void gpib_print_error(int dev);
+
+// === global variables
+pthread_rwlock_t run_lock;
+int run;
+
+// === program entry point
+int main(int argc, char const *argv[])
+{
+	int ret = 0;
+
+	pthread_t t_commander;
+	pthread_t t_worker;
+
+	// === we need actual information w/o buffering
+	setlinebuf(stdout);
+	setlinebuf(stderr);
+
+	// === initialize run state variable
+	pthread_rwlock_init(&run_lock, NULL);
+	run = 1;
+
+	// === now start threads
+	pthread_create(&t_commander, NULL, commander, NULL);
+	pthread_create(&t_worker, NULL, worker, NULL);
+
+	// === and wait ...
+	pthread_join(t_worker, NULL);
+
+	// === cancel commander thread becouse we don't need it anymore
+	// === and wait for cancelation finish
+	pthread_cancel(t_commander);
+	pthread_join(t_commander, NULL);
+	printf("\n");
+
+	return ret;
+}
+
+// === commander function
+void *commander(void *arg)
+{
+	(void) arg;
+
+	char str[100];
+	char *s;
+	int ccount;
+
+	while(get_run())
+	{
+		printf("> ");
+
+		s = fgets(str, 100, stdin);
+		if (s == NULL)
+		{
+			fprintf(stderr, "# E: Exit\n");
+			set_run(0);
+			break;
+		}
+
+		switch(str[0])
+		{
+			case 'h':
+				printf(
+					"Help:\n"
+					"\th -- this help;\n"
+					"\tq -- exit the program;\n");
+				break;
+			case 'q':
+				set_run(0);
+				break;
+			default:
+				ccount = strlen(str)-1;
+				fprintf(stderr, "# E: Unknown command (%.*s)\n", ccount, str);
+				break;
+		}
+	}
+
+	return NULL;
+}
+
+// === worker function
+void *worker(void *arg)
+{
+	(void) arg;
+
+	int r;
+
+	int vm_fd;
+	int if_fd;
+
+	char filename[100];
+	FILE *fp;
+
+	char *rbuf;
+	const size_t rbufsize = 2000000;
+
+	rbuf = (char *) malloc(rbufsize);
+	if (rbuf == NULL)
+	{
+		fprintf(stderr, "# E: Unable to allocate %ld bytes (%s)\n", rbufsize, strerror(errno));
+		goto worker_nomem;
+	}
+
+	// === first we are connecting to instruments
+	r = vm_fd  = gpib_open(VM_GPIB_NAME);  if(r == -1) goto worker_vm_ibfind;
+	r = if_fd  = gpib_open(IF_GPIB_NAME);  if(r == -1) goto worker_if_ibfind;
+
+	// === init vm
+	gpib_write(vm_fd, "function \"voltage:dc\"");
+	gpib_write(vm_fd, "voltage:dc:range:auto off");
+	gpib_write(vm_fd, "voltage:dc:range 10");
+	gpib_write(vm_fd, "voltage:dc:resolution 1e-5");
+	gpib_write(vm_fd, "voltage:dc:nplcycles 0.02");
+	gpib_write(vm_fd, "trigger:source immediate");
+	gpib_write(vm_fd, "trigger:delay:auto off");
+	gpib_write(vm_fd, "trigger:delay 0");
+	gpib_write(vm_fd, "trigger:count 1");
+	gpib_write(vm_fd, "data:feed rdg_store, \"calculate\"");
+
+	gpib_print_error(vm_fd);
+
+	// === configure gpib interface
+	ibconfig(if_fd, IbcAUTOPOLL, 1);
+
+	// === create log file
+	snprintf(filename, 100, "test.dat");
+
+	fp = fopen(filename, "w+");
+	if(fp == NULL)
+	{
+		fprintf(stderr, "# E: Unable to open file \"%s\" (%s)\n", filename, strerror(errno));
+		goto worker_fopen;
+	}
+	setlinebuf(fp);
+
+	// === write vac header
+	r = fprintf(fp,
+		"# Columns:\n"
+		"# 1 - points\n"
+		"# 2 - avarage duration, s\n"
+		"# 3 - avarage duration per point, s\n"
+	);
+	if(r < 0)
+	{
+		fprintf(stderr, "# E: Unable to print to file \"%s\" (%s)\n", filename, strerror(r));
+		goto worker_header;
+	}
+
+	// === let the action begins!
+
+	for (int points = VM_POINTS_STEP; points <= VM_POINTS; points += VM_POINTS_STEP)
+	{
+		double t = 0.0;
+
+		fprintf(stderr, "# points = %d\n", points);
+
+		gpib_print(vm_fd, "sample:count %d", points);
+
+		if(get_run())
+		{
+			for (int i = 0; i < REPETITIONS; ++i)
+			{
+				double t1, t2;
+
+				memset(rbuf, 0, rbufsize);
+
+				gpib_write(vm_fd, "*cls");
+				gpib_write(vm_fd, "*sre 16");
+
+				t1 = get_time();
+
+				gpib_write(vm_fd, "init");
+				gpib_write(vm_fd, "fetch?");
+
+				fprintf(stderr, "# wait...\n");
+				r = ibwait(if_fd, SRQI | TIMO);
+
+				t2 = get_time();
+
+				if     (r | SRQI) fprintf(stderr, "SRQI\n");
+				else if(r | TIMO) fprintf(stderr, "TIMO\n");
+
+				gpib_read(vm_fd, rbuf, rbufsize);
+
+				fprintf(stderr, "# duration = %le\n", t2-t1);
+
+				t += t2-t1;
+
+				// gpib_print_error(vm_fd);
+			}
+		}
+		else
+		{
+			break;
+		}
+
+		fprintf(fp, "%d\t%le\t%le\n", points, t / REPETITIONS, t / (points * REPETITIONS));
+	}
+
+
+	worker_header:
+
+	r = fclose(fp);
+	if (r == EOF)
+	{
+		fprintf(stderr, "# E: Unable to close file \"%s\" (%s)\n", filename, strerror(errno));
+	}
+	worker_fopen:
+
+	worker_if_ibfind:
+
+	gpib_close(vm_fd);
+	worker_vm_ibfind:
+
+	free(rbuf);
+	worker_nomem:
+
+	return NULL;
+}
+
+// === utils
+int get_run()
+{
+	int run_local;
+	pthread_rwlock_rdlock(&run_lock);
+		run_local = run;
+	pthread_rwlock_unlock(&run_lock);
+	return run_local;
+}
+
+void set_run(int run_new)
+{
+	pthread_rwlock_wrlock(&run_lock);
+		run = run_new;
+	pthread_rwlock_unlock(&run_lock);
+}
+
+double get_time()
+{
+	static int first = 1;
+	static struct timeval t_first = {0};
+	struct timeval t = {0};
+	double ret;
+	int r;
+
+	if (first == 1)
+	{
+		r = gettimeofday(&t_first, NULL);
+		if (r == -1)
+		{
+			fprintf(stderr, "# E: unable to get time (%s)\n", strerror(errno));
+			ret = -1;
+		}
+		else
+		{
+			ret = 0.0;
+			first = 0;
+		}
+	}
+	else
+	{
+		r = gettimeofday(&t, NULL);
+		if (r == -1)
+		{
+			fprintf(stderr, "# E: unable to get time (%s)\n", strerror(errno));
+			ret = -2;
+		}
+		else
+		{
+			ret = (t.tv_sec - t_first.tv_sec) * 1e6 + (t.tv_usec - t_first.tv_usec);
+			ret /= 1e6;
+		}
+	}
+
+	return ret;
+}
+
+// === GPIB ===
+
+int gpib_open(const char *name)
+{
+	int r;
+
+	r = ibfind(name);
+	if (r == -1)
+	{
+		fprintf(stderr, "# E: unable to open gpib (ibsta = %d, iberr = %d)\n", ibsta, iberr);
+	}
+
+	return r;
+}
+
+int gpib_close(int dev)
+{
+	int r;
+	int ret = 0;
+
+	r = ibclr(dev);
+	if (r & 0x8000)
+	{
+		ret = -1;
+		fprintf(stderr, "# E: unable to clr gpib (ibsta = %d, iberr = %d)\n", ibsta, iberr);
+	}
+
+	r = gpib_write(dev, "*rst");
+	if (r == -1)
+	{
+		ret = r;
+	}
+
+	sleep(1);
+
+	r = ibloc(dev);
+	if (r & 0x8000)
+	{
+		ret = -1;
+		fprintf(stderr, "# E: unable to loc gpib (ibsta = %d, iberr = %d)\n", ibsta, iberr);
+	}
+
+	return ret;
+}
+
+int gpib_read(int dev, char *buf, size_t buf_length)
+{
+	int r;
+	int ret = 0;
+
+	r = ibrd(dev, buf, buf_length);
+	if (r & 0x8000)
+	{
+		ret = -1;
+		fprintf(stderr, "# E: unable to write to gpib (ibsta = %d, iberr = %d)\n", ibsta, iberr);
+	}
+	else
+	{
+		ret = ibcnt;
+		if (ibcnt < buf_length)
+		{
+			buf[ibcnt] = 0;
+		}
+	}
+
+	return ret;
+}
+
+int gpib_write(int dev, const char *str)
+{
+	int r;
+	int ret = 0;
+
+	r = ibwrt(dev, str, strlen(str));
+	if (r & 0x8000)
+	{
+		ret = -1;
+		fprintf(stderr, "# E: unable to write to gpib (ibsta = %d, iberr = %d)\n", ibsta, iberr);
+	}
+	else
+	{
+		ret = ibcnt;
+	}
+
+	return ret;
+}
+
+int gpib_print(int dev, const char *format, ...)
+{
+	int r;
+	va_list args;
+	char buf[100];
+	const size_t bufsize = 100;
+
+	va_start(args, format);
+	r = vsnprintf(buf, bufsize, format, args);
+	if (r < 0)
+	{
+		fprintf(stderr, "# E: unable to printf to buffer (%s)\n", strerror(errno));
+		goto gpib_print_vsnprintf;
+	}
+	r = gpib_write(dev, buf);
+	gpib_print_vsnprintf:
+	va_end(args);
+
+	return r;
+}
+
+void gpib_print_error(int dev)
+{
+	char buf[100] = {0};
+	gpib_write(dev, "system:error?");
+	gpib_read(dev, buf, 100);
+	fprintf(stderr, "# [debug] error = %s\n", buf);
+}
